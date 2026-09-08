@@ -196,8 +196,52 @@ export const api = {
   },
   adminUpdateMedia: (id: string, body: any) => adminUpdate('media', id, body),
   adminDeleteMedia: async (id: string) => {
-    // Preserve the original behavior: soft delete, keep the object in Storage.
-    return adminUpdate('media', id, { active: false });
+    await adminCheck();
+
+    const { data: media, error: mediaError } = await supabase
+      .from('media')
+      .select('id,storage_path,file_url')
+      .eq('id', id)
+      .single();
+    if (mediaError) fail(mediaError);
+
+    const { data: settings, error: settingsError } = await supabase
+      .from('site_settings')
+      .select('hero_image_url,about_image_url')
+      .eq('id', 1)
+      .single();
+    if (settingsError) fail(settingsError);
+
+    const settingsPatch: Record<string, string> = {};
+    if (settings.hero_image_url === media.file_url) settingsPatch.hero_image_url = '';
+    if (settings.about_image_url === media.file_url) settingsPatch.about_image_url = '';
+
+    if (Object.keys(settingsPatch).length > 0) {
+      const { error: clearReferenceError } = await supabase
+        .from('site_settings')
+        .update(settingsPatch)
+        .eq('id', 1);
+      if (clearReferenceError) fail(clearReferenceError);
+    }
+
+    const { error: storageError } = await supabase.storage
+      .from(MEDIA_BUCKET)
+      .remove([media.storage_path]);
+
+    if (storageError) {
+      if (Object.keys(settingsPatch).length > 0) {
+        await supabase.from('site_settings').update({
+          ...(settingsPatch.hero_image_url !== undefined ? { hero_image_url: media.file_url } : {}),
+          ...(settingsPatch.about_image_url !== undefined ? { about_image_url: media.file_url } : {}),
+        }).eq('id', 1);
+      }
+      fail(storageError);
+    }
+
+    const { error: deleteError } = await supabase.from('media').delete().eq('id', id);
+    if (deleteError) fail(deleteError);
+
+    return { ok: true };
   },
 
   contentBlocks: () => publicList('content_blocks'),
