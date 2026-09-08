@@ -9,7 +9,7 @@ import * as ImagePicker from 'expo-image-picker';
 import { colors, spacing, type, fonts, radius } from '@/src/theme';
 import { PillButton } from '@/src/components/PillButton';
 import { SectionHead } from '@/src/components/SectionHead';
-import { api, Service, Zone, Faq, Testimonial, Media, Client, ContentBlock, absoluteMediaUrl } from '@/src/api';
+import { api, BookingStatus, Service, Zone, Faq, Testimonial, Media, Client, ContentBlock, absoluteMediaUrl } from '@/src/api';
 
 type Tab = 'inicio' | 'servicios' | 'zonas' | 'faqs' | 'resenas' | 'clientes' | 'contenido' | 'fotos' | 'ajustes' | 'cuenta';
 
@@ -78,13 +78,41 @@ function labelFor(t: Tab) {
   return m[t];
 }
 
+const BOOKING_STATUS_OPTIONS: { value: BookingStatus; label: string }[] = [
+  { value: 'pending_confirmation', label: 'Pendiente' },
+  { value: 'confirmed', label: 'Confirmada' },
+  { value: 'completed', label: 'Completada' },
+  { value: 'cancelled', label: 'Cancelada' },
+  { value: 'no_show', label: 'No asistió' },
+];
+
+function bookingStatusLabel(status: string) {
+  return BOOKING_STATUS_OPTIONS.find(x => x.value === status)?.label || status;
+}
+
 function HomeTab() {
   const [bookings, setBookings] = useState<any[]>([]);
   const [refreshing, setRefreshing] = useState(false);
+  const [updatingStatusId, setUpdatingStatusId] = useState<string | null>(null);
+
   const load = useCallback(async () => {
     try { setBookings(await api.adminBookings()); } catch {}
   }, []);
+
   useEffect(() => { load(); }, [load]);
+
+  const changeStatus = async (bookingId: string, status: BookingStatus) => {
+    setUpdatingStatusId(bookingId);
+    try {
+      await api.adminUpdateBookingStatus(bookingId, status);
+      setBookings(items => items.map(item => item.id === bookingId ? { ...item, status } : item));
+    } catch (e: any) {
+      alert(e.message || 'No se pudo actualizar el estatus');
+    } finally {
+      setUpdatingStatusId(null);
+    }
+  };
+
   return (
     <ScrollView contentContainerStyle={{ padding: spacing.xl, paddingBottom: 80 }} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={async () => { setRefreshing(true); await load(); setRefreshing(false); }} />}>
       <SectionHead eyebrow="Resumen" title="Próximas reservas" />
@@ -94,14 +122,42 @@ function HomeTab() {
         </View>
       ) : bookings.map(b => (
         <View key={b.id} style={styles.card}>
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
-            <Text style={type.bodyStrong}>{b.service_name}</Text>
-            <Text style={[type.micro, { color: colors.bronze }]}>{b.status.toUpperCase()}</Text>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: spacing.md }}>
+            <Text style={[type.bodyStrong, { flex: 1 }]}>{b.service_name}</Text>
+            <Text style={[type.micro, { color: colors.bronze }]}>{bookingStatusLabel(b.status).toUpperCase()}</Text>
           </View>
-          <Text style={[type.small, { marginTop: 4 }]}>{b.date} · {b.time} · ${b.service_price} MXN</Text>
+          <Text style={[type.small, { marginTop: 4 }]}>{b.date} · {String(b.time).slice(0, 5)} · ${b.service_price} MXN</Text>
           <Text style={[type.small, { marginTop: 4 }]}>{b.name} · {b.phone}</Text>
+          <Text style={[type.micro, { marginTop: 6, color: b.phone_verified_at ? colors.bronze : colors.inkSoft }]}>
+            {b.phone_verified_at ? 'TELÉFONO VERIFICADO POR SMS' : 'TELÉFONO SIN VERIFICACIÓN SMS'}
+          </Text>
           <Text style={[type.small, { marginTop: 4 }]}>{b.address}, {b.neighborhood}</Text>
           {b.note ? <Text style={[type.small, { marginTop: 6, fontStyle: 'italic' }]}>&ldquo;{b.note}&rdquo;</Text> : null}
+
+          <Text style={[type.micro, { marginTop: spacing.lg, marginBottom: spacing.sm }]}>CAMBIAR ESTATUS</Text>
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
+            {BOOKING_STATUS_OPTIONS.map(option => {
+              const active = b.status === option.value;
+              const disabled = updatingStatusId === b.id;
+              return (
+                <Pressable
+                  key={option.value}
+                  disabled={disabled}
+                  onPress={() => changeStatus(b.id, option.value)}
+                  style={[
+                    styles.statusChip,
+                    active && styles.statusChipActive,
+                    disabled && { opacity: 0.55 },
+                  ]}
+                  testID={`booking-${b.id}-status-${option.value}`}
+                >
+                  <Text style={[styles.statusChipText, active && { color: colors.paper }]}>
+                    {option.label.toUpperCase()}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
         </View>
       ))}
     </ScrollView>
@@ -904,4 +960,7 @@ const styles = StyleSheet.create({
   mediaCard: { flexDirection: 'row', gap: spacing.md, padding: spacing.md, borderWidth: 1, borderColor: colors.line, backgroundColor: colors.white, borderRadius: radius.md },
   mediaThumb: { width: 76, height: 76, borderRadius: radius.sm, overflow: 'hidden', backgroundColor: colors.paperDeep },
   mediaAction: { fontFamily: fonts.sansBold, fontSize: 10, letterSpacing: 0.8, color: colors.ink, paddingVertical: 4, paddingHorizontal: 8, borderRadius: radius.pill, borderWidth: 1, borderColor: colors.line },
+  statusChip: { paddingVertical: 7, paddingHorizontal: 10, borderRadius: radius.pill, borderWidth: 1, borderColor: colors.line, backgroundColor: colors.white },
+  statusChipActive: { backgroundColor: colors.ink, borderColor: colors.ink },
+  statusChipText: { fontFamily: fonts.sansBold, fontSize: 9, letterSpacing: 0.7, color: colors.ink },
 });
