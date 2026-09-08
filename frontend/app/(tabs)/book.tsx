@@ -8,7 +8,7 @@ import { colors, spacing, type, fonts, radius } from '@/src/theme';
 import { PillButton } from '@/src/components/PillButton';
 import { SectionHead } from '@/src/components/SectionHead';
 import { LocationPicker } from '@/src/components/LocationPicker';
-import { api, Service } from '@/src/api';
+import { api, normalizeBookingPhone, Service } from '@/src/api';
 import { openWhatsApp, waMessages } from '@/src/contact';
 
 const DAY_LABELS_JS = ['DOM', 'LUN', 'MAR', 'MIÉ', 'JUE', 'VIE', 'SÁB'];
@@ -24,7 +24,7 @@ function toDateStr(d: Date) {
 export default function Book() {
   const insets = useSafeAreaInsets();
   const { serviceId } = useLocalSearchParams<{ serviceId?: string }>();
-  const [step, setStep] = useState<1 | 2 | 3>(1);
+  const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
   const [services, setServices] = useState<Service[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [openDays, setOpenDays] = useState<number[]>([0]);
@@ -38,12 +38,17 @@ export default function Book() {
   const [submitting, setSubmitting] = useState(false);
   const [confirmed, setConfirmed] = useState<any | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [phoneVerificationRequired, setPhoneVerificationRequired] = useState(false);
+  const [otpPhone, setOtpPhone] = useState('');
+  const [otpCode, setOtpCode] = useState('');
+  const [resendSeconds, setResendSeconds] = useState(0);
 
   useEffect(() => {
     (async () => {
       try {
         const [s, bs] = await Promise.all([api.services(), api.bookingSettings()]);
         setServices(s);
+        setPhoneVerificationRequired(bs.phone_verification_required === true);
         if (bs.weekly_schedule && typeof bs.weekly_schedule === 'object') {
           const enabledDays = Object.entries(bs.weekly_schedule)
             .filter(([, config]: any) => config?.enabled === true)
@@ -74,6 +79,13 @@ export default function Book() {
   }, [openDays]);
 
   const service = services.find(s => s.id === selected);
+  const totalSteps = phoneVerificationRequired ? 4 : 3;
+
+  useEffect(() => {
+    if (resendSeconds <= 0) return;
+    const timer = setTimeout(() => setResendSeconds(v => Math.max(0, v - 1)), 1000);
+    return () => clearTimeout(timer);
+  }, [resendSeconds]);
 
   useEffect(() => {
     if (!selectedDate || !selected) { setSlots([]); return; }
@@ -87,35 +99,84 @@ export default function Book() {
   const canGoStep2 = !!selected;
   const canGoStep3 = !!selected && !!selectedDate && !!selectedSlot;
 
+  const bookingBody = (phone: string) => ({
+    service_id: service!.id,
+    date: selectedDate,
+    time: selectedSlot,
+    name: form.name.trim(),
+    phone,
+    address: form.address.trim(),
+    neighborhood: form.neighborhood.trim(),
+    note: form.note.trim(),
+    latitude: pin.lat,
+    longitude: pin.lng,
+    accepted_policies: form.accept,
+  });
+
+  const validatedPhone = () => {
+    if (!form.name.trim() || !form.phone.trim() || !form.address.trim() || !form.neighborhood.trim()) {
+      throw new Error('Por favor completa todos los campos requeridos.');
+    }
+    if (!form.accept) {
+      throw new Error('Debes aceptar las políticas y el aviso de privacidad.');
+    }
+    return normalizeBookingPhone(form.phone);
+  };
+
   const submit = async () => {
     if (!service || !selectedDate || !selectedSlot) return;
     setError(null);
-    if (!form.name.trim() || !form.phone.trim() || !form.address.trim() || !form.neighborhood.trim()) {
-      setError('Por favor completa todos los campos requeridos.');
+
+    let phone: string;
+    try {
+      phone = validatedPhone();
+    } catch (e: any) {
+      setError(e.message || 'Revisa tus datos.');
       return;
     }
-    if (!form.accept) {
-      setError('Debes aceptar las políticas y el aviso de privacidad.');
-      return;
-    }
+
     setSubmitting(true);
     try {
-      const r = await api.createBooking({
-        service_id: service.id,
-        date: selectedDate,
-        time: selectedSlot,
-        name: form.name,
-        phone: form.phone,
-        address: form.address,
-        neighborhood: form.neighborhood,
-        note: form.note,
-        latitude: pin.lat,
-        longitude: pin.lng,
-        accepted_policies: form.accept,
-      });
-      setConfirmed(r);
+      if (phoneVerificationRequired) {
+        const r = await api.requestBookingOtp(phone);
+        setOtpPhone(r.phone);
+        setOtpCode('');
+        setResendSeconds(60);
+        setStep(4);
+      } else {
+        setConfirmed(await api.createBooking(bookingBody(phone)));
+      }
     } catch (e: any) {
       setError(e.message || 'Error al reservar');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const verifyOtpAndSubmit = async () => {
+    if (!service || !selectedDate || !selectedSlot || !otpPhone) return;
+    setError(null);
+    setSubmitting(true);
+    try {
+      const r = await api.verifyBookingOtpAndCreate(otpPhone, otpCode, bookingBody(otpPhone));
+      setConfirmed(r);
+    } catch (e: any) {
+      setError(e.message || 'No se pudo verificar el código.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const resendOtp = async () => {
+    if (!otpPhone || resendSeconds > 0) return;
+    setError(null);
+    setSubmitting(true);
+    try {
+      const r = await api.requestBookingOtp(otpPhone);
+      setOtpPhone(r.phone);
+      setResendSeconds(60);
+    } catch (e: any) {
+      setError(e.message || 'No se pudo reenviar el código.');
     } finally {
       setSubmitting(false);
     }
@@ -125,7 +186,7 @@ export default function Book() {
     return (
       <View style={{ flex: 1, backgroundColor: colors.paper }}>
         <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
-          <Text style={styles.brand}>Reserva confirmada</Text>
+          <Text style={styles.brand}>Reserva recibida</Text>
         </View>
         <ScrollView contentContainerStyle={{ padding: spacing.xl, paddingBottom: 140 }}>
           <View style={styles.successCard}>
@@ -156,8 +217,10 @@ export default function Book() {
             label="Nueva reserva"
             variant="secondary"
             onPress={() => {
+              api.resetBookingOtp();
               setConfirmed(null); setStep(1); setSelected(null); setSelectedDate(null); setSelectedSlot(null);
               setForm({ name: '', phone: '', address: '', neighborhood: '', note: '', accept: false });
+              setOtpPhone(''); setOtpCode(''); setResendSeconds(0);
               setPin({ lat: null, lng: null });
             }}
             style={{ marginTop: spacing.md, alignSelf: 'flex-start' }}
@@ -171,12 +234,12 @@ export default function Book() {
     <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1, backgroundColor: colors.paper }}>
       <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
         <Text style={styles.brand}>Reservar</Text>
-        <Text style={styles.brandSub}>Paso {step} de 3</Text>
+        <Text style={styles.brandSub}>Paso {step} de {totalSteps}</Text>
       </View>
 
       <ScrollView contentContainerStyle={{ padding: spacing.xl, paddingBottom: 220 }} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
         <View style={styles.progressRow}>
-          {[1, 2, 3].map(n => (
+          {Array.from({ length: totalSteps }, (_, i) => i + 1).map(n => (
             <View key={n} style={[styles.progressStep, { backgroundColor: n <= step ? colors.bronze : colors.line }]} />
           ))}
         </View>
@@ -286,6 +349,9 @@ export default function Book() {
             </View>
             <Field label="Nombre completo" value={form.name} onChange={(v: string) => setForm({ ...form, name: v })} testID="input-name" />
             <Field label="Teléfono" value={form.phone} onChange={(v: string) => setForm({ ...form, phone: v })} keyboardType="phone-pad" testID="input-phone" />
+            <Text style={[type.small, { marginTop: 6, color: colors.inkSoft }]}>
+              10 dígitos se interpretan como México (+52). Para otro país incluye + y el código de país.
+            </Text>
             <Field label="Dirección completa" value={form.address} onChange={(v: string) => setForm({ ...form, address: v })} testID="input-address" />
             <Field label="Colonia" value={form.neighborhood} onChange={(v: string) => setForm({ ...form, neighborhood: v })} testID="input-neighborhood" />
             <Field label="Nota (opcional)" value={form.note} onChange={(v: string) => setForm({ ...form, note: v })} multiline testID="input-note" />
@@ -313,16 +379,70 @@ export default function Book() {
 
             <View style={{ flexDirection: 'row', gap: spacing.md, marginTop: spacing.xl }}>
               <PillButton label="Atrás" variant="secondary" onPress={() => setStep(2)} />
-              <PillButton label="Confirmar reserva" onPress={submit} loading={submitting} testID="book-submit-btn" style={{ flex: 1 }} />
+              <PillButton label={phoneVerificationRequired ? 'Enviar código SMS' : 'Confirmar reserva'} onPress={submit} loading={submitting} testID="book-submit-btn" style={{ flex: 1 }} />
             </View>
           </View>
         )}
+
+
+        {step === 4 && service && phoneVerificationRequired && (
+          <View>
+            <SectionHead eyebrow="Paso 04" title="Verifica tu teléfono" />
+            <View style={styles.selectedSvc}>
+              <Text style={[type.micro, { color: colors.bronze }]}>CÓDIGO SMS</Text>
+              <Text style={[type.bodyStrong, { marginTop: 4 }]}>Enviamos un código de 6 dígitos a {otpPhone}</Text>
+              <Text style={[type.small, { marginTop: 6, color: colors.inkSoft }]}>
+                La reserva no se crea hasta que el número quede verificado.
+              </Text>
+            </View>
+
+            <Field
+              label="Código de verificación"
+              value={otpCode}
+              onChange={(v: string) => setOtpCode(v.replace(/\D/g, '').slice(0, 6))}
+              keyboardType="number-pad"
+              maxLength={6}
+              testID="input-otp"
+            />
+
+            {error ? <Text style={styles.errorText}>{error}</Text> : null}
+
+            <PillButton
+              label="Verificar y crear reserva"
+              onPress={verifyOtpAndSubmit}
+              loading={submitting}
+              disabled={otpCode.length !== 6}
+              testID="verify-otp-btn"
+              style={{ marginTop: spacing.xl }}
+              fullWidth
+            />
+
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.lg, marginTop: spacing.lg, flexWrap: 'wrap' }}>
+              <Pressable
+                onPress={async () => {
+                  await api.resetBookingOtp();
+                  setOtpCode('');
+                  setError(null);
+                  setStep(3);
+                }}
+              >
+                <Text style={[type.button, { color: colors.ink }]}>CAMBIAR NÚMERO</Text>
+              </Pressable>
+              <Pressable onPress={resendOtp} disabled={resendSeconds > 0 || submitting}>
+                <Text style={[type.button, { color: resendSeconds > 0 ? colors.inkSoft : colors.bronze }]}>
+                  {resendSeconds > 0 ? `REENVIAR EN ${resendSeconds}S` : 'REENVIAR CÓDIGO'}
+                </Text>
+              </Pressable>
+            </View>
+          </View>
+        )}
+
       </ScrollView>
     </KeyboardAvoidingView>
   );
 }
 
-function Field({ label, value, onChange, keyboardType, multiline, testID }: any) {
+function Field({ label, value, onChange, keyboardType, multiline, maxLength, testID }: any) {
   return (
     <View style={{ marginTop: spacing.lg }}>
       <Text style={styles.fieldLabel}>{label.toUpperCase()}</Text>
@@ -331,6 +451,7 @@ function Field({ label, value, onChange, keyboardType, multiline, testID }: any)
         onChangeText={onChange}
         keyboardType={keyboardType}
         multiline={multiline}
+        maxLength={maxLength}
         style={[styles.input, multiline && { minHeight: 80, textAlignVertical: 'top' }]}
         placeholderTextColor={colors.inkSoft}
         testID={testID}
