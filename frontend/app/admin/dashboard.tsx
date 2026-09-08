@@ -397,33 +397,96 @@ function SettingsTab() {
   const [bs, setBs] = useState<any>(null);
   const [ss, setSs] = useState<any>(null);
   const [savedMsg, setSavedMsg] = useState<string | null>(null);
+
+  const normalizeSchedule = (raw: any) => {
+    if (raw?.weekly_schedule) return raw.weekly_schedule;
+
+    const enabled = new Set<number>(raw?.open_days || [0]);
+    const openTime = `${String(raw?.open_hour ?? 11).padStart(2, '0')}:00`;
+    const closeHour = Number(raw?.close_hour ?? 18);
+    const closeTime = closeHour >= 24 ? '23:59' : `${String(closeHour).padStart(2, '0')}:00`;
+
+    return Object.fromEntries(
+      Array.from({ length: 7 }, (_, day) => [
+        String(day),
+        { enabled: enabled.has(day), open_time: openTime, close_time: closeTime },
+      ])
+    );
+  };
+
   useEffect(() => {
     (async () => {
       try {
-        setBs(await api.bookingSettings());
-        setSs(await api.siteSettings());
+        const [bookingSettings, siteSettings] = await Promise.all([
+          api.bookingSettings(),
+          api.siteSettings(),
+        ]);
+        setBs({
+          ...bookingSettings,
+          weekly_schedule: normalizeSchedule(bookingSettings),
+        });
+        setSs(siteSettings);
       } catch {}
     })();
   }, []);
-  const toggleDay = (d: number) => {
+
+  const updateDay = (day: number, patch: Record<string, any>) => {
     if (!bs) return;
-    const set = new Set<number>(bs.open_days || []);
-    if (set.has(d)) set.delete(d); else set.add(d);
-    setBs({ ...bs, open_days: Array.from(set).sort() });
+    const key = String(day);
+    const schedule = bs.weekly_schedule || normalizeSchedule(bs);
+    setBs({
+      ...bs,
+      weekly_schedule: {
+        ...schedule,
+        [key]: { ...schedule[key], ...patch },
+      },
+    });
   };
+
   const saveBs = async () => {
     try {
-      await api.adminUpdateBookingSettings({
-        open_days: bs.open_days,
-        open_hour: parseInt(String(bs.open_hour)) || 11,
-        close_hour: parseInt(String(bs.close_hour)) || 18,
-        min_notice_minutes: parseInt(String(bs.min_notice_minutes)) || 60,
-        slot_step_minutes: parseInt(String(bs.slot_step_minutes)) || 15,
+      const schedule = bs.weekly_schedule || normalizeSchedule(bs);
+      const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
+      const dayNames = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+
+      for (let day = 0; day < 7; day++) {
+        const config = schedule[String(day)];
+        if (!config) throw new Error(`Falta la configuración de ${dayNames[day]}.`);
+        if (!timePattern.test(config.open_time) || !timePattern.test(config.close_time)) {
+          throw new Error(`Revisa el horario de ${dayNames[day]}. Usa formato HH:MM.`);
+        }
+        if (config.enabled && config.open_time >= config.close_time) {
+          throw new Error(`En ${dayNames[day]}, el cierre debe ser posterior a la apertura.`);
+        }
+      }
+
+      const enabledDays = Array.from({ length: 7 }, (_, day) => day)
+        .filter(day => schedule[String(day)]?.enabled);
+      const firstEnabled = enabledDays.length > 0 ? schedule[String(enabledDays[0])] : null;
+      const firstOpenHour = firstEnabled ? parseInt(firstEnabled.open_time.split(':')[0], 10) : Number(bs.open_hour ?? 11);
+      const firstCloseParts = firstEnabled ? firstEnabled.close_time.split(':').map(Number) : [Number(bs.close_hour ?? 18), 0];
+      const legacyCloseHour = Math.min(24, firstCloseParts[0] + (firstCloseParts[1] > 0 ? 1 : 0));
+
+      const updated = await api.adminUpdateBookingSettings({
+        weekly_schedule: schedule,
+        open_days: enabledDays,
+        open_hour: firstOpenHour,
+        close_hour: Math.max(legacyCloseHour, firstOpenHour + 1),
+        min_notice_minutes: parseInt(String(bs.min_notice_minutes), 10) || 0,
+        slot_step_minutes: parseInt(String(bs.slot_step_minutes), 10) || 15,
+      });
+
+      setBs({
+        ...updated,
+        weekly_schedule: normalizeSchedule(updated),
       });
       setSavedMsg('Agenda actualizada');
       setTimeout(() => setSavedMsg(null), 2000);
-    } catch (e: any) { alert(e.message); }
+    } catch (e: any) {
+      alert(e.message || 'No se pudo guardar la agenda');
+    }
   };
+
   const saveSs = async () => {
     try {
       await api.adminUpdateSiteSettings(ss);
@@ -431,26 +494,71 @@ function SettingsTab() {
       setTimeout(() => setSavedMsg(null), 2000);
     } catch (e: any) { alert(e.message); }
   };
+
   if (!bs || !ss) return null;
-  const dayNames = ['DOM', 'LUN', 'MAR', 'MIÉ', 'JUE', 'VIE', 'SÁB'];
+
+  const dayNames = ['DOMINGO', 'LUNES', 'MARTES', 'MIÉRCOLES', 'JUEVES', 'VIERNES', 'SÁBADO'];
+  const schedule = bs.weekly_schedule || normalizeSchedule(bs);
+
   return (
-    <ScrollView contentContainerStyle={{ padding: spacing.xl, paddingBottom: 80 }}>
+    <ScrollView contentContainerStyle={{ padding: spacing.xl, paddingBottom: 80 }} keyboardShouldPersistTaps="handled">
       <SectionHead eyebrow="Agenda" title="Días y horarios" />
-      <Text style={[type.small, { marginBottom: spacing.md }]}>Los clientes solo verán como reservables los días marcados abajo y dentro del rango horario que definas. Cambia lo que quieras cuando quieras.</Text>
-      <View style={{ flexDirection: 'row', gap: spacing.sm, flexWrap: 'wrap' }}>
-        {dayNames.map((n, i) => {
-          const on = (bs.open_days || []).includes(i);
-          return (
-            <Pressable key={i} onPress={() => toggleDay(i)} style={[styles.dayToggle, on && { backgroundColor: colors.ink, borderColor: colors.ink }]} testID={`day-${i}`}>
-              <Text style={[styles.dayToggleText, on && { color: colors.paper }]}>{n}</Text>
-            </Pressable>
-          );
-        })}
-      </View>
-      <FormField label="Hora de apertura (0-23)" value={String(bs.open_hour)} onChange={v => setBs({ ...bs, open_hour: v })} keyboardType="number-pad" />
-      <FormField label="Hora de cierre (0-23, último fin)" value={String(bs.close_hour)} onChange={v => setBs({ ...bs, close_hour: v })} keyboardType="number-pad" />
-      <FormField label="Aviso mínimo (min)" value={String(bs.min_notice_minutes)} onChange={v => setBs({ ...bs, min_notice_minutes: v })} keyboardType="number-pad" />
-      <FormField label="Intervalo entre inicios (min)" value={String(bs.slot_step_minutes)} onChange={v => setBs({ ...bs, slot_step_minutes: v })} keyboardType="number-pad" />
+      <Text style={[type.small, { marginBottom: spacing.lg }]}>
+        Activa solo los días que quieras ofrecer automáticamente y configura una apertura y cierre distintos para cada día.
+      </Text>
+
+      {dayNames.map((name, day) => {
+        const config = schedule[String(day)];
+        return (
+          <View key={day} style={[styles.card, config.enabled && { borderColor: colors.bronze }]}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: spacing.md }}>
+              <View style={{ flex: 1 }}>
+                <Text style={type.bodyStrong}>{name}</Text>
+                <Text style={[type.small, { marginTop: 3, color: colors.inkSoft }]}>
+                  {config.enabled ? `${config.open_time} – ${config.close_time}` : 'No disponible para reservas'}
+                </Text>
+              </View>
+              <Switch
+                value={!!config.enabled}
+                onValueChange={enabled => updateDay(day, { enabled })}
+                testID={`day-${day}`}
+              />
+            </View>
+
+            {config.enabled ? (
+              <View style={{ flexDirection: 'row', gap: spacing.md, marginTop: spacing.sm }}>
+                <View style={{ flex: 1 }}>
+                  <FormField
+                    label="Apertura (HH:MM)"
+                    value={config.open_time}
+                    onChange={(open_time: string) => updateDay(day, { open_time })}
+                  />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <FormField
+                    label="Cierre (HH:MM)"
+                    value={config.close_time}
+                    onChange={(close_time: string) => updateDay(day, { close_time })}
+                  />
+                </View>
+              </View>
+            ) : null}
+          </View>
+        );
+      })}
+
+      <FormField
+        label="Aviso mínimo (min)"
+        value={String(bs.min_notice_minutes)}
+        onChange={v => setBs({ ...bs, min_notice_minutes: v })}
+        keyboardType="number-pad"
+      />
+      <FormField
+        label="Intervalo entre inicios (min)"
+        value={String(bs.slot_step_minutes)}
+        onChange={v => setBs({ ...bs, slot_step_minutes: v })}
+        keyboardType="number-pad"
+      />
       <PillButton label="Guardar agenda" onPress={saveBs} style={{ marginTop: spacing.lg }} testID="save-schedule-btn" />
 
       <View style={{ height: spacing.huge }} />
