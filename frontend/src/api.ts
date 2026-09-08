@@ -1,7 +1,45 @@
 import { Platform } from 'react-native';
-import { supabase } from './supabase';
+import { createEphemeralSupabaseClient, supabase } from './supabase';
 
 const MEDIA_BUCKET = 'barber-media';
+
+let bookingOtpClient: ReturnType<typeof createEphemeralSupabaseClient> | null = null;
+
+export function normalizeBookingPhone(input: string) {
+  const raw = String(input || '').trim();
+  const digits = raw.replace(/\D/g, '');
+
+  if (raw.startsWith('+')) {
+    if (digits.length < 8 || digits.length > 15) {
+      throw new Error('Ingresa un teléfono válido con código de país.');
+    }
+    return `+${digits}`;
+  }
+
+  // The business operates in Torreón. A plain 10-digit number is treated as Mexico (+52).
+  if (digits.length === 10) return `+52${digits}`;
+
+  // Allow users who typed the country code but omitted the leading plus.
+  if (digits.length >= 11 && digits.length <= 15) return `+${digits}`;
+
+  throw new Error('Ingresa 10 dígitos de México o incluye + y el código de país.');
+}
+
+function bookingRpcParams(body: any) {
+  return {
+    p_service_id: body.service_id,
+    p_date: body.date,
+    p_time: body.time,
+    p_name: body.name,
+    p_phone: body.phone,
+    p_address: body.address,
+    p_neighborhood: body.neighborhood,
+    p_note: body.note || '',
+    p_latitude: body.latitude ?? null,
+    p_longitude: body.longitude ?? null,
+    p_accepted_policies: body.accepted_policies === true,
+  };
+}
 
 function fail(error: any): never {
   throw new Error(error?.message || 'Ocurrió un error inesperado');
@@ -80,21 +118,61 @@ export const api = {
   },
 
   createBooking: async (body: any) => {
-    const { data, error } = await supabase.rpc('create_booking', {
-      p_service_id: body.service_id,
-      p_date: body.date,
-      p_time: body.time,
-      p_name: body.name,
-      p_phone: body.phone,
-      p_address: body.address,
-      p_neighborhood: body.neighborhood,
-      p_note: body.note || '',
-      p_latitude: body.latitude ?? null,
-      p_longitude: body.longitude ?? null,
-      p_accepted_policies: body.accepted_policies === true,
-    });
+    const { data, error } = await supabase.rpc('create_booking', bookingRpcParams(body));
     if (error) fail(error);
     return data;
+  },
+
+  requestBookingOtp: async (phoneInput: string) => {
+    const phone = normalizeBookingPhone(phoneInput);
+    bookingOtpClient = createEphemeralSupabaseClient();
+    const { error } = await bookingOtpClient.auth.signInWithOtp({ phone });
+    if (error) {
+      bookingOtpClient = null;
+      if (/phone provider|sms provider|unsupported phone/i.test(error.message || '')) {
+        throw new Error('La verificación SMS todavía no está configurada.');
+      }
+      fail(error);
+    }
+    return { phone };
+  },
+
+  verifyBookingOtpAndCreate: async (phoneInput: string, tokenInput: string, body: any) => {
+    const phone = normalizeBookingPhone(phoneInput);
+    const token = String(tokenInput || '').replace(/\D/g, '').slice(0, 6);
+    if (token.length !== 6) throw new Error('Ingresa el código de 6 dígitos.');
+
+    if (!bookingOtpClient) {
+      throw new Error('Solicita un código SMS nuevo para continuar.');
+    }
+
+    const { data: verification, error: verifyError } = await bookingOtpClient.auth.verifyOtp({
+      phone,
+      token,
+      type: 'sms',
+    });
+    if (verifyError || !verification.session) {
+      if (verifyError) fail(verifyError);
+      throw new Error('No se pudo verificar el código SMS.');
+    }
+
+    const { data, error } = await bookingOtpClient.rpc('create_booking', bookingRpcParams({
+      ...body,
+      phone,
+    }));
+
+    if (error) fail(error);
+
+    await bookingOtpClient.auth.signOut({ scope: 'local' }).catch(() => undefined);
+    bookingOtpClient = null;
+    return data;
+  },
+
+  resetBookingOtp: async () => {
+    if (bookingOtpClient) {
+      await bookingOtpClient.auth.signOut({ scope: 'local' }).catch(() => undefined);
+    }
+    bookingOtpClient = null;
   },
 
   // Admin auth
@@ -155,10 +233,16 @@ export const api = {
     await adminCheck();
     const { data, error } = await supabase
       .from('bookings')
-      .select('id,service_id,service_name,service_duration,service_price,date,time,name,phone,address,neighborhood,note,latitude,longitude,accepted_policies,status,created_at')
+      .select('id,service_id,service_name,service_duration,service_price,date,time,name,phone,address,neighborhood,note,latitude,longitude,accepted_policies,phone_verified_at,status,created_at')
       .order('created_at', { ascending: false });
     if (error) fail(error);
     return data || [];
+  },
+
+  adminUpdateBookingStatus: async (id: string, status: string) => {
+    const allowed = ['pending_confirmation', 'confirmed', 'completed', 'cancelled', 'no_show'];
+    if (!allowed.includes(status)) throw new Error('Estatus de reserva inválido');
+    return adminUpdate('bookings', id, { status });
   },
 
   adminUpdateSiteSettings: async (body: any) => {
@@ -270,7 +354,7 @@ export const api = {
     const { data: client, error: clientError } = await supabase.from('clients').select('*').eq('id', id).single();
     if (clientError) fail(clientError);
     const { data: bookings, error: bookingsError } = await supabase.from('bookings')
-      .select('id,service_id,service_name,service_duration,service_price,date,time,name,phone,address,neighborhood,note,latitude,longitude,status,created_at')
+      .select('id,service_id,service_name,service_duration,service_price,date,time,name,phone,address,neighborhood,note,latitude,longitude,phone_verified_at,status,created_at')
       .eq('phone_key', client.phone_key)
       .order('date', { ascending: false })
       .order('time', { ascending: false });
@@ -339,3 +423,5 @@ export type SiteSettings = { business_name: string; full_name: string; descripto
 export type Media = { id: string; storage_path: string; file_url: string; content_type: string; size: number; category: string; alt_text: string; active: boolean; display_order: number; created_at: string; };
 export type ContentBlock = { section_key: string; eyebrow: string; title: string; content: string; cta_label?: string; cta_url?: string; active: boolean; };
 export type Client = { id: string; phone: string; phone_key: string; name: string; first_seen_at: string; last_seen_at: string; bookings_count: number; last_address: string; last_neighborhood: string; last_latitude?: number | null; last_longitude?: number | null; notes: string; tags: string[]; };
+
+export type BookingStatus = 'pending_confirmation' | 'confirmed' | 'completed' | 'cancelled' | 'no_show';
