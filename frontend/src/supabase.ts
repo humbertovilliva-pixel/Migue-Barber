@@ -17,3 +17,13 @@ export const supabase = createClient(url, publishableKey, {
     detectSessionInUrl: Platform.OS === 'web',
   },
 });
+
+export function createEphemeralSupabaseClient() {
+  return createClient(url, publishableKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+      detectSessionInUrl: false,
+    },
+  });
+}
