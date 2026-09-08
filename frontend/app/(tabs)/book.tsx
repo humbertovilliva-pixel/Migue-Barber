@@ -44,7 +44,15 @@ export default function Book() {
       try {
         const [s, bs] = await Promise.all([api.services(), api.bookingSettings()]);
         setServices(s);
-        setOpenDays(bs.open_days || [0]);
+        if (bs.weekly_schedule && typeof bs.weekly_schedule === 'object') {
+          const enabledDays = Object.entries(bs.weekly_schedule)
+            .filter(([, config]: any) => config?.enabled === true)
+            .map(([day]) => Number(day))
+            .filter(day => Number.isInteger(day) && day >= 0 && day <= 6);
+          setOpenDays(enabledDays);
+        } else {
+          setOpenDays(bs.open_days || [0]);
+        }
         if (serviceId) {
           setSelected(String(serviceId));
         }
@@ -201,12 +209,12 @@ export default function Book() {
               fullWidth
             />
             <View style={styles.altBox}>
-              <Text style={[type.micro, { color: colors.bronze }]}>ENTRE SEMANA</Text>
+              <Text style={[type.micro, { color: colors.bronze }]}>OTRO HORARIO</Text>
               <Text style={[type.body, { marginTop: spacing.sm }]}>
-                Los horarios entre semana (8:30 p. m. – 11:00 p. m.) se solicitan directamente por WhatsApp y están sujetos a confirmación.
+                Si no encuentras una fecha u hora disponible en la agenda, puedes solicitar una opción especial directamente por WhatsApp.
               </Text>
               <PillButton
-                label="Solicitar entre semana"
+                label="Solicitar otro horario"
                 variant="secondary"
                 onPress={() => openWhatsApp(waMessages.weekday)}
                 testID="weekday-request-btn"
